@@ -1,16 +1,12 @@
 name: Instagram Auto-Poster
 
+permissions:
+  contents: write
+
 on:
   schedule:
-    # Run daily at 9:00 AM UTC
     - cron: '0 9 * * *'
-  # Allow manual triggering from GitHub UI
   workflow_dispatch:
-    inputs:
-      test_mode:
-        description: 'Test mode (skip actual posting)'
-        required: false
-        default: 'false'
 
 jobs:
   post-to-instagram:
@@ -18,14 +14,14 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4  # Updated from v3 to v4
+      uses: actions/checkout@v4
       with:
-        persist-credentials: true
+        token: ${{ secrets.GITHUB_TOKEN }}
     
     - name: Set up Python
-      uses: actions/setup-python@v5  # Updated from v4 to v5
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.10'  # Updated to 3.10 for better compatibility
+        python-version: '3.11'
     
     - name: Install system dependencies
       run: |
@@ -34,14 +30,13 @@ jobs:
     
     - name: Install Python dependencies
       run: |
-        pip install -r src/requirements.txt
+        pip install Pillow==10.1.0 instagrapi==1.16.42 google-api-python-client==2.108.0 google-auth-httplib2==0.1.1 google-auth-oauthlib==1.1.0 requests==2.31.0 python-dotenv==1.0.0
     
     - name: Set up Google Drive credentials
       env:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
-        mkdir -p ~/.config
-        echo "$GDRIVE_CREDENTIALS" > ~/.config/gdrive_creds.json
+        echo "$GDRIVE_CREDENTIALS" > /tmp/gdrive_creds.json
     
     - name: Create configuration
       env:
@@ -58,10 +53,10 @@ jobs:
         SKIP_PROBLEMATIC_VIDEOS = True
         MAX_ERRORS_BEFORE_STOP = 5
         POST_DAILY = True
-        LOG_LEVEL = "DEBUG"  # Changed to DEBUG for troubleshooting
+        LOG_LEVEL = "INFO"
         EOF
     
-    - name: Create directory structure
+    - name: Create directories
       run: |
         mkdir -p downloads segments temp state
     
@@ -70,29 +65,18 @@ jobs:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
         cd src
-        python main.py 2>&1
+        python main.py
     
-    - name: Commit and push state changes
+    - name: Commit state changes
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        git config --local user.email "github-actions@github.com"
-        git config --local user.name "GitHub Actions"
+        git config --global user.email "github-actions@github.com"
+        git config --global user.name "GitHub Actions"
         git add state/
-        git diff --cached --quiet || git commit -m "Update posting state [skip ci]"
-        git push
+        git diff --cached --quiet || (git commit -m "Update posting state [skip ci]" && git push)
     
-    - name: Clean up workspace
+    - name: Clean up
       run: |
-        rm -rf downloads/
-        rm -rf segments/
-        rm -rf temp/
-        rm -f ~/.config/gdrive_creds.json
-    
-    - name: Upload logs (on failure)
-      if: failure()
-      uses: actions/upload-artifact@v4  # CHANGED FROM v3 to v4
-      with:
-        name: error-logs
-        path: |
-          src/instagram_poster.log
-          state/posting_state.json
-        retention-days: 7
+        rm -rf downloads segments temp
+        rm -f /tmp/gdrive_creds.json
