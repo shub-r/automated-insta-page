@@ -50,13 +50,9 @@ jobs:
         GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
       run: |
         echo "=== CREATING CONFIG FROM SECRETS ==="
-        echo "Username: ${INSTAGRAM_USERNAME:0:3}..."
-        echo "Password: ${#INSTAGRAM_PASSWORD} chars"
-        echo "Folder ID: $GDRIVE_FOLDER_ID"
-        echo "================================"
         
-        # Create config.py with proper values
-        cat > src/config.py << EOF
+        # Write config.py line by line (safer for YAML)
+        cat > src/config.py << "CONFIG_EOF"
 INSTAGRAM_USERNAME = "$INSTAGRAM_USERNAME"
 INSTAGRAM_PASSWORD = "$INSTAGRAM_PASSWORD"
 GDRIVE_FOLDER_ID = "$GDRIVE_FOLDER_ID"
@@ -66,14 +62,14 @@ SKIP_PROBLEMATIC_VIDEOS = True
 MAX_ERRORS_BEFORE_STOP = 5
 POST_DAILY = True
 LOG_LEVEL = "DEBUG"
-EOF
+CONFIG_EOF
         
         echo "Config created. Verifying..."
         echo "Folder ID in config:"
         grep "GDRIVE_FOLDER_ID" src/config.py
         echo ""
-        echo "Config file content:"
-        cat src/config.py
+        echo "Config file first few lines:"
+        head -5 src/config.py
     
     - name: Set up Google Drive credentials
       env:
