@@ -5,8 +5,13 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # Daily at 9 AM UTC
+    - cron: '0 9 * * *'  # Daily at 9:00 AM UTC
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode (dry run)'
+        required: false
+        default: 'false'
 
 jobs:
   post-to-instagram:
@@ -18,10 +23,13 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
     
-    - name: Clean up hardcoded config
+    - name: Clean existing config
       run: |
-        # Remove any existing config with hardcoded values
-        rm -f src/config.py
+        # Remove any existing config.py with hardcoded values
+        if [ -f "src/config.py" ]; then
+          echo "Removing existing config.py..."
+          rm src/config.py
+        fi
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -49,61 +57,78 @@ jobs:
         INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
         GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
       run: |
-        echo "=== CREATING CONFIG FROM SECRETS ==="
+        # Create config.py using simple echo commands
+        echo 'INSTAGRAM_USERNAME = "'"$INSTAGRAM_USERNAME"'"' > src/config.py
+        echo 'INSTAGRAM_PASSWORD = "'"$INSTAGRAM_PASSWORD"'"' >> src/config.py
+        echo 'GDRIVE_FOLDER_ID = "'"$GDRIVE_FOLDER_ID"'"' >> src/config.py
+        echo 'VIDEO_SEGMENT_MAX_DURATION = 170' >> src/config.py
+        echo 'SPEED_FACTOR = 1.25' >> src/config.py
+        echo 'SKIP_PROBLEMATIC_VIDEOS = True' >> src/config.py
+        echo 'MAX_ERRORS_BEFORE_STOP = 5' >> src/config.py
+        echo 'POST_DAILY = True' >> src/config.py
+        echo 'LOG_LEVEL = "DEBUG"' >> src/config.py
         
-        # Write config.py line by line (safer for YAML)
-        cat > src/config.py << "CONFIG_EOF"
-INSTAGRAM_USERNAME = "$INSTAGRAM_USERNAME"
-INSTAGRAM_PASSWORD = "$INSTAGRAM_PASSWORD"
-GDRIVE_FOLDER_ID = "$GDRIVE_FOLDER_ID"
-VIDEO_SEGMENT_MAX_DURATION = 170
-SPEED_FACTOR = 1.25
-SKIP_PROBLEMATIC_VIDEOS = True
-MAX_ERRORS_BEFORE_STOP = 5
-POST_DAILY = True
-LOG_LEVEL = "DEBUG"
-CONFIG_EOF
-        
-        echo "Config created. Verifying..."
-        echo "Folder ID in config:"
-        grep "GDRIVE_FOLDER_ID" src/config.py
+        echo "Config file created successfully!"
         echo ""
-        echo "Config file first few lines:"
-        head -5 src/config.py
+        echo "=== Verifying config.py ==="
+        echo "First few lines:"
+        head -10 src/config.py
+        echo ""
+        echo "Folder ID check:"
+        grep "GDRIVE_FOLDER_ID" src/config.py
     
     - name: Set up Google Drive credentials
       env:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
         echo "$GDRIVE_CREDENTIALS" > /tmp/gdrive_creds.json
+        echo "Google Drive credentials saved"
     
     - name: Create directories
       run: |
         mkdir -p downloads segments temp state
+        echo "Created directories: downloads/, segments/, temp/, state/"
     
     - name: Run Instagram Auto-Poster
       env:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
         cd src
+        echo "Starting Instagram Auto-Poster..."
         python main.py
     
-    - name: Commit state changes
+    - name: Commit and push state changes
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         git config --global user.email "github-actions@github.com"
         git config --global user.name "GitHub Actions"
-        git add state/
         
-        if git diff --cached --quiet; then
-          echo "No changes to commit"
-        else
+        # Check if there are changes in state directory
+        if [ -n "$(git status --porcelain state/)" ]; then
+          echo "Changes detected in state directory"
+          git add state/
           git commit -m "Update posting state [skip ci]"
           git push
+          echo "State changes committed and pushed"
+        else
+          echo "No changes in state directory"
         fi
     
-    - name: Clean up
+    - name: Clean up workspace
       run: |
-        rm -rf downloads segments temp
+        rm -rf downloads/
+        rm -rf segments/
+        rm -rf temp/
         rm -f /tmp/gdrive_creds.json
+        echo "Workspace cleaned up"
+    
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: error-logs
+        path: |
+          src/instagram_poster.log
+          state/posting_state.json
+        retention-days: 7
