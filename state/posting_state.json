@@ -1,0 +1,10 @@
+{
+  "last_run_date": null,
+  "current_video_index": 0,
+  "current_video_id": null,
+  "processed_videos": [],
+  "failed_videos": [],
+  "total_posts": 0,
+  "consecutive_errors": 0,
+  "last_error": null
+}
