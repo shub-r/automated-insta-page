@@ -18,19 +18,19 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4  # Updated from v3 to v4
       with:
         persist-credentials: true
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5  # Updated from v4 to v5
       with:
-        python-version: '3.9'
+        python-version: '3.10'  # Updated to 3.10 for better compatibility
     
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y ffmpeg
+        sudo apt-get install -y ffmpeg python3-pip
     
     - name: Install Python dependencies
       run: |
@@ -40,7 +40,8 @@ jobs:
       env:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
-        echo "$GDRIVE_CREDENTIALS" > src/gdrive_credentials.json
+        mkdir -p ~/.config
+        echo "$GDRIVE_CREDENTIALS" > ~/.config/gdrive_creds.json
     
     - name: Create configuration
       env:
@@ -57,22 +58,26 @@ jobs:
         SKIP_PROBLEMATIC_VIDEOS = True
         MAX_ERRORS_BEFORE_STOP = 5
         POST_DAILY = True
-        LOG_LEVEL = "INFO"
+        LOG_LEVEL = "DEBUG"  # Changed to DEBUG for troubleshooting
         EOF
+    
+    - name: Create directory structure
+      run: |
+        mkdir -p downloads segments temp state
     
     - name: Run Instagram Auto-Poster
       env:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
         cd src
-        python main.py
+        python main.py 2>&1
     
     - name: Commit and push state changes
       run: |
         git config --local user.email "github-actions@github.com"
         git config --local user.name "GitHub Actions"
         git add state/
-        git commit -m "Update posting state [skip ci]" || echo "No changes to commit"
+        git diff --cached --quiet || git commit -m "Update posting state [skip ci]"
         git push
     
     - name: Clean up workspace
@@ -80,14 +85,14 @@ jobs:
         rm -rf downloads/
         rm -rf segments/
         rm -rf temp/
-        rm -f src/gdrive_credentials.json
-        rm -f src/instagram_poster.log
+        rm -f ~/.config/gdrive_creds.json
     
     - name: Upload logs (on failure)
       if: failure()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4  # CHANGED FROM v3 to v4
       with:
         name: error-logs
         path: |
           src/instagram_poster.log
           state/posting_state.json
+        retention-days: 7
