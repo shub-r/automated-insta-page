@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.env.local
+
+# Video files
+downloads/
+segments/
+temp/
+
+# Credentials
+*.json
+*.key
+*.pem
+credentials.json
+src/gdrive_credentials.json
+
+# Logs
+*.log
+instagram_poster.log
+
+# State (committed to git)
+# state/posting_state.json  # This is committed!
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
