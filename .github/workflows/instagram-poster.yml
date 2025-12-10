@@ -14,6 +14,10 @@ on:
         description: 'Force specific part number'
         required: false
         default: ''
+      reset_errors:
+        description: 'Reset consecutive errors count'
+        required: false
+        default: 'false'
 
 jobs:
   post-to-instagram:
@@ -24,7 +28,23 @@ jobs:
       uses: actions/checkout@v3
       with:
         fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Reset error count if requested
+      if: ${{ github.event.inputs.reset_errors == 'true' }}
+      run: |
+        echo "Resetting error count..."
+        if [ -f state/posting_state.json ]; then
+          python3 -c "
+          import json
+          with open('state/posting_state.json', 'r') as f:
+              state = json.load(f)
+          state['consecutive_errors'] = 0
+          state['error_history'] = []
+          with open('state/posting_state.json', 'w') as f:
+              json.dump(state, f, indent=2)
+          print('Reset consecutive_errors to 0')
+          "
+        fi
         
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -56,7 +76,7 @@ jobs:
         
         # Google Drive Credentials
         GDRIVE_FOLDER_ID = "${{ secrets.GDRIVE_FOLDER_ID }}"
-        # Credentials are loaded from file
+        GDRIVE_CREDENTIALS = """${{ secrets.GDRIVE_CREDENTIALS }}"""
         
         # Posting Configuration
         POSTING_TIME = "09:00"  # UTC time
@@ -74,25 +94,74 @@ jobs:
         MAX_CONSECUTIVE_ERRORS = 5
         EOF
         
-    - name: Create Google Drive credentials
+    - name: Create Google Drive credentials file
       run: |
         mkdir -p src
-        # Use a different method to handle multiline JSON
-        echo '${{ secrets.GDRIVE_CREDENTIALS }}' > src/gdrive_creds_temp.json
-        # Fix line endings and formatting
+        # Write the credentials JSON directly
+        echo '${{ secrets.GDRIVE_CREDENTIALS }}' > src/google_credentials_temp.txt
+        # Clean up and format the JSON
         python3 -c "
         import json
-        import sys
-        # Read the JSON from GitHub Secrets
-        with open('src/gdrive_creds_temp.json', 'r') as f:
-            data = f.read()
-        # Parse and re-serialize to ensure valid JSON
-        creds = json.loads(data)
-        with open('src/google_credentials.json', 'w') as f:
-            json.dump(creds, f, indent=2)
-        print('Google credentials file created successfully')
+        # Read the raw content
+        with open('src/google_credentials_temp.txt', 'r') as f:
+            content = f.read()
+        
+        # Remove any escaped newlines if present
+        content = content.replace('\\n', '\n')
+        
+        # Parse JSON to validate
+        try:
+            creds = json.loads(content)
+            # Write properly formatted JSON
+            with open('src/google_credentials.json', 'w') as f:
+                json.dump(creds, f, indent=2)
+            print('✅ Google credentials file created successfully')
+        except json.JSONDecodeError as e:
+            print(f'❌ Failed to parse JSON: {e}')
+            print('Content preview:', content[:200])
         "
-        rm -f src/gdrive_creds_temp.json
+        rm -f src/google_credentials_temp.txt
+        
+    - name: Debug - List files
+      run: |
+        echo "=== Current Directory Structure ==="
+        find . -type f -name "*.py" -o -name "*.json" -o -name "*.txt" | sort
+        echo "=== State File Content ==="
+        cat state/posting_state.json || echo "No state file"
+        echo "=== Config File Preview ==="
+        head -20 src/config.py || echo "No config file"
+        
+    - name: Test Google Drive connection
+      run: |
+        cd src
+        python3 -c "
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        import json
+        
+        try:
+            with open('google_credentials.json', 'r') as f:
+                creds_dict = json.load(f)
+            
+            credentials = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=['https://www.googleapis.com/auth/drive.readonly']
+            )
+            
+            service = build('drive', 'v3', credentials=credentials)
+            print('✅ Google Drive API connection successful')
+            
+            # Test listing root folder
+            results = service.files().list(
+                pageSize=1,
+                fields='files(id, name)'
+            ).execute()
+            
+            print(f'✅ Found {len(results.get(\"files\", []))} files')
+            
+        except Exception as e:
+            print(f'❌ Google Drive connection failed: {e}')
+        "
         
     - name: Run Instagram Poster
       run: |
@@ -103,18 +172,19 @@ jobs:
           CMD="$CMD --force-day=\"${{ github.event.inputs.force_day }}\""
         fi
         if [ -n "${{ github.event.inputs.force_part }}" ]; then
-          CMD="$CMD --force-part=\"${{ github.event.inputs.force_part }}\""
+          CMD="$CMD --force-part=${{ github.event.inputs.force_part }}"
         fi
         echo "Running: $CMD"
         eval $CMD
         
     - name: Commit and push state changes
+      if: success()
       run: |
         git config --global user.name 'GitHub Actions Bot'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         
-        # Check if there are changes to commit
-        if git status --porcelain | grep -q "state/posting_state.json"; then
+        # Check if state file changed
+        if ! git diff --quiet state/posting_state.json; then
           echo "Changes detected in state file, committing..."
           git add state/posting_state.json
           git commit -m "📊 Update posting state [skip ci]"
@@ -124,18 +194,20 @@ jobs:
         fi
         
     - name: Cleanup temporary files
+      if: always()
       run: |
         rm -f src/google_credentials.json
         rm -f src/config.py
-        rm -f src/temp_video.mp4
         rm -f src/*.log
+        rm -f src/temp_*.mp4
         
-    - name: Upload logs on failure
+    - name: Upload logs and state on failure
       if: failure()
       uses: actions/upload-artifact@v3
       with:
-        name: error-logs-${{ github.run_id }}
+        name: debug-logs-${{ github.run_id }}
         path: |
           src/*.log
           state/posting_state.json
+          src/config.py
         retention-days: 7
