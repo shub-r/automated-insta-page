@@ -1,8 +1,11 @@
 {
-  "current_day": 1,
+  "current_day": "day1",
   "current_part": 1,
+  "total_parts_current_day": 0,
   "last_posted": null,
-  "total_posts": 0,
   "consecutive_errors": 0,
+  "total_posts": 0,
+  "completed_days": [],
+  "posting_history": [],
   "error_history": []
 }
