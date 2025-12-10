@@ -1,40 +1,42 @@
 #!/usr/bin/env python3
 """
-Instagram Auto-Poster
-Posts videos from Google Drive to Instagram Reels automatically
+Instagram Auto-Posting System
+Posts videos from Google Drive to Instagram Reels via Facebook Graph API
 """
 
 import os
 import sys
 import json
-import time
 import logging
+import argparse
 import tempfile
 import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import urllib.parse
+from datetime import datetime, timedelta
 
 # Third-party imports
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-import requests
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    import requests
+except ImportError as e:
+    print(f"Missing dependency: {e}")
+    print("Please install required packages: pip install -r requirements.txt")
+    sys.exit(1)
 
-# Local imports
-from config import (
-    FACEBOOK_ACCESS_TOKEN,
-    FACEBOOK_USER_ID,
-    GDRIVE_FOLDER_ID,
-    GDRIVE_CREDENTIALS_PATH,
-    MANUAL_DAY_OVERRIDE,
-    MANUAL_PART_OVERRIDE
-)
+# Import configuration
+try:
+    import config
+except ImportError:
+    print("Error: config.py not found. Ensure GitHub Secrets are properly set.")
+    sys.exit(1)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('instagram_poster.log'),
         logging.StreamHandler()
@@ -42,524 +44,519 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants
-FACEBOOK_GRAPH_URL = "https://graph.facebook.com/v18.0"
-MAX_RETRIES = 3
-MAX_CONSECUTIVE_ERRORS = 5
-STATE_FILE = Path(__file__).parent.parent / "state" / "posting_state.json"
 
-class InstagramAutoPoster:
-    def __init__(self):
-        self.consecutive_errors = 0
-        self.current_state = self.load_state()
+class GoogleDriveClient:
+    """Handles Google Drive operations"""
+    
+    def __init__(self, credentials_json: str):
+        self.credentials_json = credentials_json
+        self.service = None
+        self._authenticate()
         
-        # Initialize Google Drive API
-        self.drive_service = self.init_google_drive()
-        
-        # Get Instagram Business Account ID
-        self.instagram_account_id = self.get_instagram_account_id()
-        if not self.instagram_account_id:
-            logger.error("Could not get Instagram Business Account ID!")
-            raise Exception("Instagram Business Account ID not found")
-        
-    def init_google_drive(self):
-        """Initialize Google Drive API with service account"""
+    def _authenticate(self):
+        """Authenticate with Google Drive API"""
         try:
-            credentials = service_account.Credentials.from_service_account_file(
-                GDRIVE_CREDENTIALS_PATH,
+            # Parse credentials from JSON string
+            creds_dict = json.loads(self.credentials_json)
+            
+            # Create credentials object
+            credentials = service_account.Credentials.from_service_account_info(
+                creds_dict,
                 scopes=['https://www.googleapis.com/auth/drive.readonly']
             )
-            return build('drive', 'v3', credentials=credentials)
+            
+            # Build the service
+            self.service = build('drive', 'v3', credentials=credentials)
+            logger.info("✅ Google Drive authentication successful")
+            
         except Exception as e:
-            logger.error(f"Failed to initialize Google Drive API: {e}")
+            logger.error(f"❌ Google Drive authentication failed: {e}")
             raise
-    
-    def get_instagram_account_id(self):
-        """Get Instagram Business Account ID from Facebook Page"""
+            
+    def list_folders(self, parent_id: str) -> List[Dict]:
+        """List all folders in a parent folder"""
         try:
-            # First, get the Facebook Page connected to the Instagram account
-            pages_url = f"{FACEBOOK_GRAPH_URL}/me/accounts"
-            params = {
-                'access_token': FACEBOOK_ACCESS_TOKEN,
-                'fields': 'id,name,instagram_business_account'
-            }
-            
-            response = requests.get(pages_url, params=params)
-            response.raise_for_status()
-            
-            pages_data = response.json()
-            logger.info(f"Pages data: {json.dumps(pages_data, indent=2)}")
-            
-            # Look for the page that has an Instagram Business Account connected
-            for page in pages_data.get('data', []):
-                if 'instagram_business_account' in page:
-                    ig_business_account = page['instagram_business_account']
-                    ig_account_id = ig_business_account.get('id') if isinstance(ig_business_account, dict) else ig_business_account
-                    
-                    if ig_account_id:
-                        logger.info(f"Found Instagram Business Account ID: {ig_account_id}")
-                        return ig_account_id
-            
-            # If we have a specific user ID provided, use it directly
-            if FACEBOOK_USER_ID:
-                logger.info(f"Using provided Facebook User ID: {FACEBOOK_USER_ID}")
-                return FACEBOOK_USER_ID
-                
-            logger.error("No Instagram Business Account found connected to any Facebook Page")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error getting Instagram Account ID: {e}")
-            logger.error(f"Response: {response.text if 'response' in locals() else 'No response'}")
-            return None
-    
-    def load_state(self) -> Dict:
-        """Load posting state from JSON file"""
-        try:
-            if STATE_FILE.exists():
-                with open(STATE_FILE, 'r') as f:
-                    state = json.load(f)
-                    logger.info(f"Loaded state: {state}")
-                    return state
-        except Exception as e:
-            logger.error(f"Error loading state: {e}")
-        
-        # Default state
-        default_state = {
-            "current_day": 1,
-            "current_part": 1,
-            "last_posted": None,
-            "total_posts": 0,
-            "consecutive_errors": 0,
-            "error_history": []
-        }
-        logger.info("Using default state")
-        return default_state
-    
-    def save_state(self):
-        """Save current state to JSON file"""
-        try:
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(STATE_FILE, 'w') as f:
-                json.dump(self.current_state, f, indent=2)
-            logger.info(f"State saved: {self.current_state}")
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
-    
-    def list_day_folders(self) -> List[str]:
-        """List all day folders in the Google Drive folder"""
-        try:
-            query = f"'{GDRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder'"
-            results = self.drive_service.files().list(
+            query = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'"
+            results = self.service.files().list(
                 q=query,
+                pageSize=100,
                 fields="files(id, name)"
             ).execute()
             
             folders = results.get('files', [])
             # Sort folders by name (day1, day2, etc.)
-            sorted_folders = sorted(folders, key=lambda x: x['name'])
-            folder_names = [f['name'] for f in sorted_folders]
-            
-            logger.info(f"Found {len(folder_names)} day folders: {folder_names}")
-            return folder_names
+            folders.sort(key=lambda x: x['name'])
+            logger.info(f"📁 Found {len(folders)} folders")
+            return folders
             
         except Exception as e:
-            logger.error(f"Error listing day folders: {e}")
-            raise
-    
-    def get_videos_in_folder(self, folder_name: str) -> List[str]:
-        """Get all video files in a specific day folder"""
-        try:
-            # First, get the folder ID
-            folder_query = f"name='{folder_name}' and '{GDRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder'"
-            folder_result = self.drive_service.files().list(
-                q=folder_query,
-                fields="files(id)"
-            ).execute()
-            
-            if not folder_result.get('files'):
-                logger.error(f"Folder '{folder_name}' not found")
-                return []
-            
-            folder_id = folder_result['files'][0]['id']
-            
-            # Get video files in the folder
-            video_query = f"'{folder_id}' in parents and (mimeType contains 'video/' or name contains '.mp4')"
-            results = self.drive_service.files().list(
-                q=video_query,
-                fields="files(id, name, mimeType)"
-            ).execute()
-            
-            videos = results.get('files', [])
-            # Sort by name (part1.mp4, part2.mp4, etc.)
-            sorted_videos = sorted(videos, key=lambda x: x['name'])
-            video_names = [v['name'] for v in sorted_videos]
-            
-            logger.info(f"Found {len(video_names)} videos in {folder_name}: {video_names}")
-            return sorted_videos
-            
-        except Exception as e:
-            logger.error(f"Error getting videos in folder {folder_name}: {e}")
+            logger.error(f"❌ Failed to list folders: {e}")
             return []
-    
-    def download_video(self, video_info: Dict, download_path: Path) -> bool:
-        """Download video from Google Drive to local path"""
+            
+    def list_files(self, folder_id: str) -> List[Dict]:
+        """List all files in a folder"""
         try:
-            file_id = video_info['id']
-            filename = video_info['name']
+            query = f"'{folder_id}' in parents and mimeType contains 'video/'"
+            results = self.service.files().list(
+                q=query,
+                pageSize=100,
+                fields="files(id, name, size, mimeType, createdTime)"
+            ).execute()
             
-            request = self.drive_service.files().get_media(fileId=file_id)
+            files = results.get('files', [])
+            # Sort files by name (part1.mp4, part2.mp4, etc.)
+            files.sort(key=lambda x: x['name'])
+            logger.info(f"🎬 Found {len(files)} video files")
+            return files
             
-            with open(download_path, 'wb') as f:
+        except Exception as e:
+            logger.error(f"❌ Failed to list files: {e}")
+            return []
+            
+    def download_file(self, file_id: str, file_path: str) -> bool:
+        """Download a file from Google Drive"""
+        try:
+            request = self.service.files().get_media(fileId=file_id)
+            
+            with open(file_path, 'wb') as f:
                 downloader = MediaIoBaseDownload(f, request)
                 done = False
                 while not done:
                     status, done = downloader.next_chunk()
                     if status:
-                        logger.info(f"Download progress: {int(status.progress() * 100)}%")
-            
-            logger.info(f"Downloaded video: {filename} ({download_path.stat().st_size / 1024 / 1024:.2f} MB)")
+                        logger.info(f"⬇️ Download progress: {int(status.progress() * 100)}%")
+                        
+            logger.info(f"✅ Downloaded file to {file_path}")
             return True
             
         except Exception as e:
-            logger.error(f"Error downloading video: {e}")
+            logger.error(f"❌ Failed to download file: {e}")
             return False
+
+
+class InstagramPoster:
+    """Handles Instagram posting via Facebook Graph API"""
     
-    def create_instagram_container(self, video_path: Path, caption: str) -> Optional[str]:
-        """Create Instagram container for video upload"""
+    def __init__(self, access_token: str, user_id: str):
+        self.access_token = access_token
+        self.user_id = user_id
+        self.base_url = "https://graph.facebook.com/v18.0"
+        
+    def create_media_container(self, video_path: str, caption: str) -> Optional[str]:
+        """Create a media container for the video"""
         try:
-            # Step 1: Upload video and create container
-            container_url = f"{FACEBOOK_GRAPH_URL}/{self.instagram_account_id}/media"
-            
-            # First, check if we can access the Instagram account
-            check_url = f"{FACEBOOK_GRAPH_URL}/{self.instagram_account_id}"
-            check_params = {
-                'fields': 'id,name,username',
-                'access_token': FACEBOOK_ACCESS_TOKEN
-            }
-            
-            check_response = requests.get(check_url, params=check_params)
-            logger.info(f"Instagram account check: {check_response.status_code}")
-            if check_response.status_code != 200:
-                logger.error(f"Cannot access Instagram account: {check_response.text}")
-                return None
-            
-            # Now create the container
+            # First, upload the video
             with open(video_path, 'rb') as video_file:
                 files = {'video': video_file}
                 data = {
+                    'access_token': self.access_token,
                     'caption': caption,
-                    'media_type': 'REELS',
-                    'share_to_feed': True,
-                    'access_token': FACEBOOK_ACCESS_TOKEN
+                    'media_type': 'REELS'
                 }
                 
-                logger.info(f"Creating container for video: {video_path.name}")
-                logger.info(f"Container URL: {container_url}")
-                
-                response = requests.post(container_url, data=data, files=files, timeout=60)
-                
-                logger.info(f"Container creation response: {response.status_code}")
-                logger.info(f"Container creation response text: {response.text}")
-                
-                response.raise_for_status()
-                
-                result = response.json()
-                container_id = result.get('id')
-                
-                if container_id:
-                    logger.info(f"Created container: {container_id}")
-                    return container_id
-                else:
-                    logger.error(f"No container ID in response: {result}")
-                    return None
-                    
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error creating Instagram container: {e}")
-            if hasattr(e, 'response') and e.response:
-                logger.error(f"Response: {e.response.text}")
-            return None
-        except Exception as e:
-            logger.error(f"Error creating Instagram container: {e}")
-            return None
-    
-    def publish_container(self, container_id: str) -> bool:
-        """Publish the Instagram container"""
-        try:
-            publish_url = f"{FACEBOOK_GRAPH_URL}/{self.instagram_account_id}/media_publish"
-            
-            data = {
-                'creation_id': container_id,
-                'access_token': FACEBOOK_ACCESS_TOKEN
-            }
-            
-            for attempt in range(MAX_RETRIES):
-                logger.info(f"Publishing container (attempt {attempt + 1}/{MAX_RETRIES})...")
-                
-                response = requests.post(publish_url, data=data)
-                logger.info(f"Publish response: {response.status_code}")
-                logger.info(f"Publish response text: {response.text}")
+                # Create container
+                response = requests.post(
+                    f"{self.base_url}/{self.user_id}/media",
+                    data=data,
+                    files=files
+                )
                 
                 if response.status_code == 200:
-                    result = response.json()
-                    if result.get('id'):
-                        logger.info(f"Successfully published! Post ID: {result['id']}")
-                        return True
-                
-                # If not successful, wait and retry
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 10 * (attempt + 1)  # Exponential backoff
-                    logger.warning(f"Publish attempt failed, retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
+                    container_id = response.json().get('id')
+                    logger.info(f"📦 Created media container: {container_id}")
+                    return container_id
+                else:
+                    logger.error(f"❌ Failed to create container: {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"❌ Error creating media container: {e}")
+            return None
             
-            logger.error(f"Failed to publish container after {MAX_RETRIES} attempts")
+    def publish_media(self, container_id: str) -> bool:
+        """Publish the media container"""
+        try:
+            # Check container status
+            status_url = f"{self.base_url}/{container_id}"
+            for _ in range(30):  # Wait up to 5 minutes
+                status_response = requests.get(
+                    status_url,
+                    params={'access_token': self.access_token,
+                           'fields': 'status_code,status'}
+                )
+                
+                if status_response.status_code == 200:
+                    status_data = status_response.json()
+                    status = status_data.get('status_code', '')
+                    
+                    if status == 'FINISHED':
+                        # Publish the container
+                        publish_url = f"{self.base_url}/{self.user_id}/media_publish"
+                        publish_data = {
+                            'creation_id': container_id,
+                            'access_token': self.access_token
+                        }
+                        
+                        publish_response = requests.post(publish_url, data=publish_data)
+                        if publish_response.status_code == 200:
+                            logger.info("✅ Video published successfully!")
+                            return True
+                        else:
+                            logger.error(f"❌ Failed to publish: {publish_response.text}")
+                            return False
+                            
+                    elif status == 'ERROR':
+                        logger.error(f"❌ Container error: {status_data}")
+                        return False
+                        
+                    # Wait before checking again
+                    import time
+                    time.sleep(10)
+                else:
+                    logger.error(f"❌ Failed to check container status: {status_response.text}")
+                    return False
+                    
+            logger.error("❌ Timeout waiting for container to be ready")
             return False
             
         except Exception as e:
-            logger.error(f"Error publishing container: {e}")
+            logger.error(f"❌ Error publishing media: {e}")
             return False
-    
-    def generate_caption(self, day_number: int, part_number: int, total_parts: int) -> str:
-        """Generate caption for the video post"""
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            
+    def post_video(self, video_path: str, caption: str) -> bool:
+        """Complete video posting flow"""
+        logger.info("🚀 Starting Instagram posting process...")
         
-        caption = f"""Day {day_number} - Part {part_number}/{total_parts}
+        # Create media container
+        container_id = self.create_media_container(video_path, caption)
+        if not container_id:
+            return False
+            
+        # Publish media
+        return self.publish_media(container_id)
 
-📅 Posted automatically on {current_date}
+
+class StateManager:
+    """Manages posting state persistence"""
+    
+    def __init__(self, state_file: str = "state/posting_state.json"):
+        self.state_file = state_file
+        self.state = self._load_state()
+        
+    def _load_state(self) -> Dict:
+        """Load state from JSON file"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                    logger.info(f"📊 Loaded state: {state}")
+                    return state
+            else:
+                # Initial state
+                initial_state = {
+                    "current_day": "day1",
+                    "current_part": 1,
+                    "total_parts_current_day": 0,
+                    "last_posted": None,
+                    "consecutive_errors": 0,
+                    "total_posts": 0,
+                    "completed_days": [],
+                    "posting_history": []
+                }
+                logger.info("📊 Initialized new state")
+                return initial_state
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to load state: {e}")
+            return {
+                "current_day": "day1",
+                "current_part": 1,
+                "last_posted": None,
+                "consecutive_errors": 0
+            }
+            
+    def save_state(self):
+        """Save state to JSON file"""
+        try:
+            # Ensure state directory exists
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            
+            with open(self.state_file, 'w') as f:
+                json.dump(self.state, f, indent=2)
+            logger.info(f"💾 State saved: {self.state}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to save state: {e}")
+            
+    def update_post_success(self, day: str, part: int, total_parts: int, video_name: str):
+        """Update state after successful post"""
+        self.state["current_day"] = day
+        self.state["current_part"] = part + 1  # Next part
+        self.state["total_parts_current_day"] = total_parts
+        self.state["last_posted"] = datetime.now().isoformat()
+        self.state["consecutive_errors"] = 0
+        self.state["total_posts"] = self.state.get("total_posts", 0) + 1
+        
+        # Add to history
+        history_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "day": day,
+            "part": part,
+            "video": video_name,
+            "status": "success"
+        }
+        self.state.setdefault("posting_history", []).append(history_entry)
+        
+        # Keep only last 100 history entries
+        if len(self.state["posting_history"]) > 100:
+            self.state["posting_history"] = self.state["posting_history"][-100:]
+            
+        # If we've posted all parts in this day, move to next day
+        if part >= total_parts:
+            self._move_to_next_day(day)
+            
+        self.save_state()
+        
+    def _move_to_next_day(self, current_day: str):
+        """Move to the next day folder"""
+        # Extract day number
+        try:
+            day_num = int(current_day.replace("day", ""))
+            next_day = f"day{day_num + 1}"
+            self.state["current_day"] = next_day
+            self.state["current_part"] = 1
+            
+            # Add current day to completed days
+            if current_day not in self.state.get("completed_days", []):
+                self.state.setdefault("completed_days", []).append(current_day)
+                
+            logger.info(f"📅 Moving to next day: {next_day}")
+            
+        except ValueError:
+            logger.error(f"❌ Could not parse day number from {current_day}")
+            
+    def update_post_error(self, error_message: str):
+        """Update state after posting error"""
+        self.state["consecutive_errors"] = self.state.get("consecutive_errors", 0) + 1
+        self.state.setdefault("error_history", []).append({
+            "timestamp": datetime.now().isoformat(),
+            "error": error_message
+        })
+        
+        # Keep only last 50 error entries
+        if len(self.state.get("error_history", [])) > 50:
+            self.state["error_history"] = self.state["error_history"][-50:]
+            
+        self.save_state()
+        
+    def should_continue(self) -> bool:
+        """Check if we should continue posting based on error count"""
+        max_errors = getattr(config, 'MAX_CONSECUTIVE_ERRORS', 5)
+        return self.state.get("consecutive_errors", 0) < max_errors
+
+
+class InstagramAutoPoster:
+    """Main class orchestrating the auto-posting system"""
+    
+    def __init__(self):
+        # Initialize components
+        self.state_manager = StateManager()
+        self.drive_client = GoogleDriveClient(config.GDRIVE_CREDENTIALS)
+        self.instagram_poster = InstagramPoster(
+            config.FACEBOOK_ACCESS_TOKEN,
+            config.FACEBOOK_USER_ID
+        )
+        
+    def find_next_video(self, force_day: str = None, force_part: int = None) -> Tuple[Optional[Dict], Optional[Dict], int]:
+        """Find the next video to post"""
+        # Use forced values or state values
+        target_day = force_day or self.state_manager.state["current_day"]
+        target_part = force_part or self.state_manager.state["current_part"]
+        
+        logger.info(f"🔍 Looking for: {target_day}/part{target_part}.mp4")
+        
+        # List all folders
+        folders = self.drive_client.list_folders(config.GDRIVE_FOLDER_ID)
+        if not folders:
+            logger.error("❌ No folders found in Google Drive")
+            return None, None, 0
+            
+        # Find target folder
+        target_folder = None
+        for folder in folders:
+            if folder['name'].lower() == target_day.lower():
+                target_folder = folder
+                break
+                
+        if not target_folder:
+            logger.error(f"❌ Folder '{target_day}' not found")
+            # Try to find the next available folder
+            for folder in folders:
+                if folder['name'] not in self.state_manager.state.get("completed_days", []):
+                    target_folder = folder
+                    logger.info(f"🔄 Falling back to folder: {folder['name']}")
+                    break
+                    
+            if not target_folder:
+                logger.error("❌ No more folders to process")
+                return None, None, 0
+                
+        # List files in the folder
+        files = self.drive_client.list_files(target_folder['id'])
+        if not files:
+            logger.error(f"❌ No video files found in {target_folder['name']}")
+            return None, None, 0
+            
+        # Sort files by name and find target part
+        files.sort(key=lambda x: x['name'])
+        total_parts = len(files)
+        
+        # Find the specific part
+        target_video = None
+        for file in files:
+            # Extract part number from filename
+            try:
+                # Handle various naming patterns: part1.mp4, part1_video.mp4, etc.
+                filename = file['name'].lower()
+                if 'part' in filename:
+                    # Extract number after 'part'
+                    import re
+                    match = re.search(r'part(\d+)', filename)
+                    if match:
+                        part_num = int(match.group(1))
+                        if part_num == target_part:
+                            target_video = file
+                            break
+            except (ValueError, AttributeError):
+                continue
+                
+        # If target part not found, try first file
+        if not target_video and files:
+            target_video = files[0]
+            logger.warning(f"⚠️ Part {target_part} not found, using first video")
+            
+        return target_folder, target_video, total_parts
+        
+    def generate_caption(self, day: str, part: int, total_parts: int) -> str:
+        """Generate caption for the post"""
+        # Extract day number
+        day_num = day.replace("day", "").replace("Day", "").replace("DAY", "")
+        
+        # Current date
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Use template from config
+        caption_template = getattr(config, 'CAPTION_TEMPLATE', 
+            """Day {day_number} - Part {part_number}/{total_parts}
+
+📅 Posted automatically on {date}
 ⚡ Powered by GitHub Actions & Facebook Graph API
 
-#Day{day_number} #Part{part_number} #InstagramReels #AutoPost #Tech #AI #GitHubActions #Coding #Automation #Programming #DevOps #Python #FacebookAPI"""
-
+#Day{day_number} #Part{part_number} #InstagramReels #AutoPost #Tech #AI #GitHubActions #Coding #Automation""")
+        
+        caption = caption_template.format(
+            day_number=day_num,
+            part_number=part,
+            total_parts=total_parts,
+            date=current_date
+        )
+        
         return caption
-    
-    def post_video_to_instagram(self, video_path: Path, caption: str) -> bool:
-        """Main function to post video to Instagram"""
+        
+    def post_video(self, folder: Dict, video: Dict, part_number: int, total_parts: int) -> bool:
+        """Download and post a video"""
         try:
-            # Check file size (Instagram limit is 100MB for Reels)
-            file_size_mb = video_path.stat().st_size / (1024 * 1024)
-            if file_size_mb > 100:
-                logger.error(f"Video file too large: {file_size_mb:.2f}MB (max 100MB)")
-                return False
+            logger.info(f"🎥 Processing: {folder['name']}/{video['name']}")
             
-            # Check video duration (Instagram Reels limit is 90 seconds)
-            # Note: We're assuming videos are pre-optimized
+            # Create temp file for video
+            temp_dir = tempfile.gettempdir()
+            temp_video_path = os.path.join(temp_dir, "instagram_video.mp4")
             
-            # Step 1: Create container
-            logger.info("Creating Instagram container...")
-            container_id = self.create_instagram_container(video_path, caption)
-            if not container_id:
-                logger.error("Failed to create container")
-                return False
+            # Download video
+            logger.info(f"⬇️ Downloading video...")
+            if not self.drive_client.download_file(video['id'], temp_video_path):
+                raise Exception("Failed to download video")
+                
+            # Generate caption
+            caption = self.generate_caption(folder['name'], part_number, total_parts)
+            logger.info(f"📝 Caption:\n{caption}")
             
-            # Step 2: Wait a moment for processing
-            logger.info("Waiting for video processing...")
-            time.sleep(15)
+            # Post to Instagram
+            logger.info("📤 Posting to Instagram Reels...")
+            success = self.instagram_poster.post_video(temp_video_path, caption)
             
-            # Step 3: Publish container
-            logger.info("Publishing container...")
-            success = self.publish_container(container_id)
-            
-            if success:
-                logger.info("Video published successfully!")
-                # Wait a bit more for Instagram to process
-                time.sleep(5)
-            
+            # Clean up temp file
+            try:
+                os.remove(temp_video_path)
+            except:
+                pass
+                
             return success
             
         except Exception as e:
-            logger.error(f"Error posting to Instagram: {e}")
+            logger.error(f"❌ Error in post_video: {e}")
             return False
-    
-    def determine_next_video(self) -> Tuple[Optional[str], Optional[Dict]]:
-        """Determine which video to post next based on state"""
-        # Check for manual overrides
-        if MANUAL_DAY_OVERRIDE and MANUAL_DAY_OVERRIDE.isdigit():
-            self.current_state["current_day"] = int(MANUAL_DAY_OVERRIDE)
-            logger.info(f"Manual override: Setting day to {MANUAL_DAY_OVERRIDE}")
-        
-        if MANUAL_PART_OVERRIDE and MANUAL_PART_OVERRIDE.isdigit():
-            self.current_state["current_part"] = int(MANUAL_PART_OVERRIDE)
-            logger.info(f"Manual override: Setting part to {MANUAL_PART_OVERRIDE}")
-        
-        # Get all day folders
-        day_folders = self.list_day_folders()
-        if not day_folders:
-            logger.error("No day folders found!")
-            return None, None
-        
-        # Find current day folder
-        current_day = self.current_state["current_day"]
-        day_folder_name = f"day{current_day}"
-        
-        if day_folder_name not in day_folders:
-            logger.warning(f"Day folder {day_folder_name} not found, resetting to day1")
-            self.current_state["current_day"] = 1
-            self.current_state["current_part"] = 1
-            day_folder_name = "day1"
-            current_day = 1
-        
-        # Get videos in current day folder
-        videos = self.get_videos_in_folder(day_folder_name)
-        if not videos:
-            logger.error(f"No videos found in {day_folder_name}")
-            return None, None
-        
-        # Find current part
-        current_part = self.current_state["current_part"]
-        video_name = f"part{current_part}.mp4"
-        
-        # Look for the video
-        target_video = None
-        for video in videos:
-            if video['name'].lower() == video_name.lower():
-                target_video = video
-                break
-        
-        if not target_video:
-            logger.warning(f"Video {video_name} not found in {day_folder_name}")
             
-            # Check if we've completed all parts for this day
-            if current_part > len(videos):
-                # Move to next day
-                next_day = current_day + 1
-                next_day_folder = f"day{next_day}"
-                
-                if next_day_folder in day_folders:
-                    logger.info(f"Moving to next day: {next_day_folder}")
-                    self.current_state["current_day"] = next_day
-                    self.current_state["current_part"] = 1
-                    return self.determine_next_video()
-                else:
-                    # Loop back to day1
-                    logger.info("All days completed, looping back to day1")
-                    self.current_state["current_day"] = 1
-                    self.current_state["current_part"] = 1
-                    return self.determine_next_video()
-            else:
-                # Skip this part and try next
-                self.current_state["current_part"] += 1
-                return self.determine_next_video()
-        
-        return day_folder_name, target_video
-    
-    def run(self):
+    def run(self, force_day: str = None, force_part: int = None):
         """Main execution flow"""
-        try:
-            logger.info("=" * 50)
-            logger.info("Starting Instagram Auto-Poster")
-            logger.info(f"Instagram Account ID: {self.instagram_account_id}")
-            logger.info(f"Current state: Day {self.current_state['current_day']}, Part {self.current_state['current_part']}")
-            logger.info("=" * 50)
-            
-            # Check error threshold
-            if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                logger.error(f"Too many consecutive errors ({self.consecutive_errors}). Stopping.")
-                return False
-            
-            # Determine which video to post
-            day_folder_name, video_info = self.determine_next_video()
-            
-            if not day_folder_name or not video_info:
-                logger.error("Could not determine next video to post")
-                self.consecutive_errors += 1
-                return False
-            
-            day_number = int(day_folder_name.replace('day', ''))
-            part_number = self.current_state["current_part"]
-            
-            # Get total parts in current day
-            videos_in_day = self.get_videos_in_folder(day_folder_name)
-            total_parts = len(videos_in_day)
-            
-            # Generate caption
-            caption = self.generate_caption(day_number, part_number, total_parts)
-            
-            logger.info(f"Next video to post: {video_info['name']} from {day_folder_name}")
-            logger.info(f"Part: {part_number}/{total_parts}")
-            logger.info(f"Caption length: {len(caption)} characters")
-            
-            # Create temporary directory for download
-            with tempfile.TemporaryDirectory() as temp_dir:
-                download_path = Path(temp_dir) / video_info['name']
-                
-                # Download video
-                logger.info(f"Downloading video to {download_path}...")
-                if not self.download_video(video_info, download_path):
-                    logger.error("Failed to download video")
-                    self.consecutive_errors += 1
-                    return False
-                
-                # Verify file exists and has content
-                if not download_path.exists() or download_path.stat().st_size == 0:
-                    logger.error("Downloaded file is empty or doesn't exist")
-                    self.consecutive_errors += 1
-                    return False
-                
-                file_size_mb = download_path.stat().st_size / (1024 * 1024)
-                logger.info(f"Video file size: {file_size_mb:.2f} MB")
-                
-                # Post to Instagram
-                logger.info("Posting to Instagram...")
-                success = self.post_video_to_instagram(download_path, caption)
-                
-                if success:
-                    logger.info(f"Successfully posted {video_info['name']}!")
-                    
-                    # Update state
-                    self.current_state["current_part"] += 1
-                    self.current_state["last_posted"] = datetime.datetime.now().isoformat()
-                    self.current_state["total_posts"] += 1
-                    self.current_state["consecutive_errors"] = 0
-                    self.consecutive_errors = 0
-                    
-                    # Save state
-                    self.save_state()
-                    
-                    return True
-                else:
-                    logger.error(f"Failed to post {video_info['name']}")
-                    self.consecutive_errors += 1
-                    self.current_state["consecutive_errors"] = self.consecutive_errors
-                    self.current_state["error_history"].append({
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "day": day_number,
-                        "part": part_number,
-                        "video": video_info['name'],
-                        "error": "Posting failed"
-                    })
-                    
-                    # Keep only last 10 errors
-                    if len(self.current_state["error_history"]) > 10:
-                        self.current_state["error_history"] = self.current_state["error_history"][-10:]
-                    
-                    self.save_state()
-                    
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Unexpected error in run(): {e}")
-            self.consecutive_errors += 1
+        logger.info("🚀 Starting Instagram Auto-Poster")
+        
+        # Check if we should continue based on error count
+        if not self.state_manager.should_continue():
+            logger.error("🚫 Too many consecutive errors. Stopping.")
             return False
+            
+        try:
+            # Find next video to post
+            folder, video, total_parts = self.find_next_video(force_day, force_part)
+            if not folder or not video:
+                logger.error("❌ Could not find video to post")
+                self.state_manager.update_post_error("No video found")
+                return False
+                
+            # Determine part number
+            current_part = force_part or self.state_manager.state["current_part"]
+            
+            # Post the video
+            success = self.post_video(folder, video, current_part, total_parts)
+            
+            if success:
+                logger.info("✅ Post successful!")
+                self.state_manager.update_post_success(
+                    folder['name'],
+                    current_part,
+                    total_parts,
+                    video['name']
+                )
+                return True
+            else:
+                logger.error("❌ Post failed")
+                self.state_manager.update_post_error("Instagram posting failed")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Unexpected error: {e}")
+            self.state_manager.update_post_error(str(e))
+            return False
+
 
 def main():
     """Main entry point"""
-    try:
-        poster = InstagramAutoPoster()
-        success = poster.run()
-        
-        if success:
-            logger.info("Instagram Auto-Poster completed successfully!")
-            sys.exit(0)
-        else:
-            logger.error("Instagram Auto-Poster failed!")
-            sys.exit(1)
-            
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description='Instagram Auto Poster')
+    parser.add_argument('--force-day', help='Force specific day folder', default=None)
+    parser.add_argument('--force-part', type=int, help='Force specific part number', default=None)
+    
+    args = parser.parse_args()
+    
+    # Create auto-poster instance
+    poster = InstagramAutoPoster()
+    
+    # Run the poster
+    success = poster.run(args.force_day, args.force_part)
+    
+    # Exit with appropriate code
+    sys.exit(0 if success else 1)
+
 
 if __name__ == "__main__":
     main()
