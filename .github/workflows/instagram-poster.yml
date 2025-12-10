@@ -1,15 +1,22 @@
 name: Instagram Auto-Poster
 
-permissions:
-  contents: write
-
 on:
   schedule:
-    - cron: '0 9 * * *'  # Daily at 9:00 AM UTC
-  workflow_dispatch:
+    # Runs daily at 9:00 AM UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      day_number:
+        description: 'Override day number (optional)'
+        required: false
+        default: ''
+      part_number:
+        description: 'Override part number (optional)'
+        required: false
+        default: ''
 
 jobs:
-  post-to-instagram:
+  instagram-poster:
     runs-on: ubuntu-latest
     
     steps:
@@ -18,56 +25,44 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
     
-    - name: Clean existing config
-      run: |
-        rm -f src/config.py
-    
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v4
       with:
-        python-version: '3.11'
+        python-version: '3.10'
     
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y ffmpeg python3-pip
+        sudo apt-get install -y ffmpeg
     
     - name: Install Python dependencies
       run: |
-        pip install requests==2.31.0
-        pip install google-api-python-client==2.108.0
-        pip install google-auth-httplib2==0.1.1
-        pip install google-auth-oauthlib==1.1.0
+        cd src
+        pip install -r requirements.txt
     
-    - name: Create configuration from GitHub Secrets
-      env:
-        FACEBOOK_ACCESS_TOKEN: ${{ secrets.FACEBOOK_ACCESS_TOKEN }}
-        FACEBOOK_USER_ID: ${{ secrets.FACEBOOK_USER_ID }}
-        GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+    - name: Create Google Drive credentials file
       run: |
-        echo 'FACEBOOK_ACCESS_TOKEN = "'"$FACEBOOK_ACCESS_TOKEN"'"' > src/config.py
-        echo 'FACEBOOK_USER_ID = "'"$FACEBOOK_USER_ID"'"' >> src/config.py
-        echo 'GDRIVE_FOLDER_ID = "'"$GDRIVE_FOLDER_ID"'"' >> src/config.py
-        echo 'VIDEO_SEGMENT_MAX_DURATION = 170' >> src/config.py
-        echo 'SPEED_FACTOR = 1.25' >> src/config.py
-        echo 'SKIP_PROBLEMATIC_VIDEOS = True' >> src/config.py
-        echo 'MAX_ERRORS_BEFORE_STOP = 5' >> src/config.py
-        echo 'POST_DAILY = True' >> src/config.py
-        echo 'LOG_LEVEL = "INFO"' >> src/config.py
+        mkdir -p ~/.config/gdrive
+        echo '${{ secrets.GDRIVE_CREDENTIALS }}' > ~/.config/gdrive/service-account.json
+    
+    - name: Create config file from secrets
+      run: |
+        cd src
+        cat > config.py << EOF
+        # Auto-generated configuration from GitHub Secrets
+        import os
         
-        echo "Config created!"
+        FACEBOOK_ACCESS_TOKEN = "${{ secrets.FACEBOOK_ACCESS_TOKEN }}"
+        FACEBOOK_USER_ID = "${{ secrets.FACEBOOK_USER_ID }}"
+        GDRIVE_FOLDER_ID = "${{ secrets.GDRIVE_FOLDER_ID }}"
+        GDRIVE_CREDENTIALS_PATH = os.path.expanduser("~/.config/gdrive/service-account.json")
+        
+        # Manual override if provided
+        MANUAL_DAY_OVERRIDE = "${{ github.event.inputs.day_number }}"
+        MANUAL_PART_OVERRIDE = "${{ github.event.inputs.part_number }}"
+        EOF
     
-    - name: Set up Google Drive credentials
-      env:
-        GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
-      run: |
-        echo "$GDRIVE_CREDENTIALS" > /tmp/gdrive_creds.json
-    
-    - name: Create directories
-      run: |
-        mkdir -p downloads segments temp state
-    
-    - name: Run Instagram Auto-Poster (Graph API)
+    - name: Run Instagram poster
       env:
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
       run: |
@@ -75,23 +70,9 @@ jobs:
         python main.py
     
     - name: Commit and push state changes
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        git config --global user.email "github-actions@github.com"
-        git config --global user.name "GitHub Actions"
-        git add state/
-        
-        if git diff --cached --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Update posting state [skip ci]"
-          git push
-        fi
-    
-    - name: Clean up workspace
-      run: |
-        rm -rf downloads/
-        rm -rf segments/
-        rm -rf temp/
-        rm -f /tmp/gdrive_creds.json
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add state/posting_state.json
+        git commit -m "Update posting state" || echo "No changes to commit"
+        git push
