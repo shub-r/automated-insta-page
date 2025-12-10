@@ -13,6 +13,7 @@ import tempfile
 import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import urllib.parse
 
 # Third-party imports
 from google.oauth2 import service_account
@@ -55,6 +56,12 @@ class InstagramAutoPoster:
         # Initialize Google Drive API
         self.drive_service = self.init_google_drive()
         
+        # Get Instagram Business Account ID
+        self.instagram_account_id = self.get_instagram_account_id()
+        if not self.instagram_account_id:
+            logger.error("Could not get Instagram Business Account ID!")
+            raise Exception("Instagram Business Account ID not found")
+        
     def init_google_drive(self):
         """Initialize Google Drive API with service account"""
         try:
@@ -66,6 +73,45 @@ class InstagramAutoPoster:
         except Exception as e:
             logger.error(f"Failed to initialize Google Drive API: {e}")
             raise
+    
+    def get_instagram_account_id(self):
+        """Get Instagram Business Account ID from Facebook Page"""
+        try:
+            # First, get the Facebook Page connected to the Instagram account
+            pages_url = f"{FACEBOOK_GRAPH_URL}/me/accounts"
+            params = {
+                'access_token': FACEBOOK_ACCESS_TOKEN,
+                'fields': 'id,name,instagram_business_account'
+            }
+            
+            response = requests.get(pages_url, params=params)
+            response.raise_for_status()
+            
+            pages_data = response.json()
+            logger.info(f"Pages data: {json.dumps(pages_data, indent=2)}")
+            
+            # Look for the page that has an Instagram Business Account connected
+            for page in pages_data.get('data', []):
+                if 'instagram_business_account' in page:
+                    ig_business_account = page['instagram_business_account']
+                    ig_account_id = ig_business_account.get('id') if isinstance(ig_business_account, dict) else ig_business_account
+                    
+                    if ig_account_id:
+                        logger.info(f"Found Instagram Business Account ID: {ig_account_id}")
+                        return ig_account_id
+            
+            # If we have a specific user ID provided, use it directly
+            if FACEBOOK_USER_ID:
+                logger.info(f"Using provided Facebook User ID: {FACEBOOK_USER_ID}")
+                return FACEBOOK_USER_ID
+                
+            logger.error("No Instagram Business Account found connected to any Facebook Page")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting Instagram Account ID: {e}")
+            logger.error(f"Response: {response.text if 'response' in locals() else 'No response'}")
+            return None
     
     def load_state(self) -> Dict:
         """Load posting state from JSON file"""
@@ -183,8 +229,22 @@ class InstagramAutoPoster:
         """Create Instagram container for video upload"""
         try:
             # Step 1: Upload video and create container
-            container_url = f"{FACEBOOK_GRAPH_URL}/{FACEBOOK_USER_ID}/media"
+            container_url = f"{FACEBOOK_GRAPH_URL}/{self.instagram_account_id}/media"
             
+            # First, check if we can access the Instagram account
+            check_url = f"{FACEBOOK_GRAPH_URL}/{self.instagram_account_id}"
+            check_params = {
+                'fields': 'id,name,username',
+                'access_token': FACEBOOK_ACCESS_TOKEN
+            }
+            
+            check_response = requests.get(check_url, params=check_params)
+            logger.info(f"Instagram account check: {check_response.status_code}")
+            if check_response.status_code != 200:
+                logger.error(f"Cannot access Instagram account: {check_response.text}")
+                return None
+            
+            # Now create the container
             with open(video_path, 'rb') as video_file:
                 files = {'video': video_file}
                 data = {
@@ -194,7 +254,14 @@ class InstagramAutoPoster:
                     'access_token': FACEBOOK_ACCESS_TOKEN
                 }
                 
-                response = requests.post(container_url, data=data, files=files)
+                logger.info(f"Creating container for video: {video_path.name}")
+                logger.info(f"Container URL: {container_url}")
+                
+                response = requests.post(container_url, data=data, files=files, timeout=60)
+                
+                logger.info(f"Container creation response: {response.status_code}")
+                logger.info(f"Container creation response text: {response.text}")
+                
                 response.raise_for_status()
                 
                 result = response.json()
@@ -207,6 +274,11 @@ class InstagramAutoPoster:
                     logger.error(f"No container ID in response: {result}")
                     return None
                     
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error creating Instagram container: {e}")
+            if hasattr(e, 'response') and e.response:
+                logger.error(f"Response: {e.response.text}")
+            return None
         except Exception as e:
             logger.error(f"Error creating Instagram container: {e}")
             return None
@@ -214,7 +286,7 @@ class InstagramAutoPoster:
     def publish_container(self, container_id: str) -> bool:
         """Publish the Instagram container"""
         try:
-            publish_url = f"{FACEBOOK_GRAPH_URL}/{container_id}/publish"
+            publish_url = f"{FACEBOOK_GRAPH_URL}/{self.instagram_account_id}/media_publish"
             
             data = {
                 'creation_id': container_id,
@@ -225,6 +297,8 @@ class InstagramAutoPoster:
                 logger.info(f"Publishing container (attempt {attempt + 1}/{MAX_RETRIES})...")
                 
                 response = requests.post(publish_url, data=data)
+                logger.info(f"Publish response: {response.status_code}")
+                logger.info(f"Publish response text: {response.text}")
                 
                 if response.status_code == 200:
                     result = response.json()
@@ -261,19 +335,32 @@ class InstagramAutoPoster:
     def post_video_to_instagram(self, video_path: Path, caption: str) -> bool:
         """Main function to post video to Instagram"""
         try:
+            # Check file size (Instagram limit is 100MB for Reels)
+            file_size_mb = video_path.stat().st_size / (1024 * 1024)
+            if file_size_mb > 100:
+                logger.error(f"Video file too large: {file_size_mb:.2f}MB (max 100MB)")
+                return False
+            
+            # Check video duration (Instagram Reels limit is 90 seconds)
+            # Note: We're assuming videos are pre-optimized
+            
             # Step 1: Create container
+            logger.info("Creating Instagram container...")
             container_id = self.create_instagram_container(video_path, caption)
             if not container_id:
+                logger.error("Failed to create container")
                 return False
             
             # Step 2: Wait a moment for processing
             logger.info("Waiting for video processing...")
-            time.sleep(10)
+            time.sleep(15)
             
             # Step 3: Publish container
+            logger.info("Publishing container...")
             success = self.publish_container(container_id)
             
             if success:
+                logger.info("Video published successfully!")
                 # Wait a bit more for Instagram to process
                 time.sleep(5)
             
@@ -360,6 +447,7 @@ class InstagramAutoPoster:
         try:
             logger.info("=" * 50)
             logger.info("Starting Instagram Auto-Poster")
+            logger.info(f"Instagram Account ID: {self.instagram_account_id}")
             logger.info(f"Current state: Day {self.current_state['current_day']}, Part {self.current_state['current_part']}")
             logger.info("=" * 50)
             
@@ -387,7 +475,8 @@ class InstagramAutoPoster:
             caption = self.generate_caption(day_number, part_number, total_parts)
             
             logger.info(f"Next video to post: {video_info['name']} from {day_folder_name}")
-            logger.info(f"Caption preview: {caption[:100]}...")
+            logger.info(f"Part: {part_number}/{total_parts}")
+            logger.info(f"Caption length: {len(caption)} characters")
             
             # Create temporary directory for download
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -405,6 +494,9 @@ class InstagramAutoPoster:
                     logger.error("Downloaded file is empty or doesn't exist")
                     self.consecutive_errors += 1
                     return False
+                
+                file_size_mb = download_path.stat().st_size / (1024 * 1024)
+                logger.info(f"Video file size: {file_size_mb:.2f} MB")
                 
                 # Post to Instagram
                 logger.info("Posting to Instagram...")
@@ -432,7 +524,8 @@ class InstagramAutoPoster:
                         "timestamp": datetime.datetime.now().isoformat(),
                         "day": day_number,
                         "part": part_number,
-                        "video": video_info['name']
+                        "video": video_info['name'],
+                        "error": "Posting failed"
                     })
                     
                     # Keep only last 10 errors
