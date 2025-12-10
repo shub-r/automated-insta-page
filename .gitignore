@@ -21,7 +21,7 @@ wheels/
 *.egg
 MANIFEST
 
-# Virtual Environments
+# Virtual Environment
 venv/
 env/
 ENV/
@@ -38,26 +38,23 @@ venv.bak/
 # Logs
 *.log
 logs/
+src/*.log
 
-# Environment variables
+# Secrets
+src/google_credentials.json
+src/config.py
 .env
 .env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # Temporary files
+*.tmp
 temp/
 tmp/
-*.tmp
-*.temp
+src/temp_*.mp4
 
-# Downloaded videos
-downloads/
-
-# Service account credentials (should be in secrets)
-service-account.json
-gdrive-credentials.json
-
-# macOS
+# System
 .DS_Store
-
-# Windows
 Thumbs.db
