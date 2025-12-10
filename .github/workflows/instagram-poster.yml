@@ -1,78 +1,114 @@
-name: Instagram Auto-Poster
+name: Instagram Auto Poster
 
 on:
   schedule:
-    # Runs daily at 9:00 AM UTC
+    # Runs daily at 9:00 AM UTC (configurable)
     - cron: '0 9 * * *'
   workflow_dispatch:  # Manual trigger
     inputs:
-      day_number:
-        description: 'Override day number (optional)'
+      force_day:
+        description: 'Force specific day (e.g., "day1")'
         required: false
         default: ''
-      part_number:
-        description: 'Override part number (optional)'
+      force_part:
+        description: 'Force specific part number'
         required: false
         default: ''
 
 jobs:
-  instagram-poster:
+  post-to-instagram:
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-    
+        
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
-    
-    - name: Install system dependencies
+        python-version: '3.9'
+        
+    - name: Install FFmpeg
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
-    
-    - name: Install Python dependencies
+        
+    - name: Install dependencies
       run: |
         cd src
         pip install -r requirements.txt
-    
-    - name: Create Google Drive credentials file
+        
+    - name: Create configuration file
       run: |
-        mkdir -p ~/.config/gdrive
-        echo '${{ secrets.GDRIVE_CREDENTIALS }}' > ~/.config/gdrive/service-account.json
-    
-    - name: Create config file from secrets
-      run: |
-        cd src
-        cat > config.py << EOF
-        # Auto-generated configuration from GitHub Secrets
+        mkdir -p src
+        cat > src/config.py << 'EOF'
+        # Auto-generated from GitHub Secrets
         import os
         
+        # Facebook/Instagram Credentials
         FACEBOOK_ACCESS_TOKEN = "${{ secrets.FACEBOOK_ACCESS_TOKEN }}"
         FACEBOOK_USER_ID = "${{ secrets.FACEBOOK_USER_ID }}"
-        GDRIVE_FOLDER_ID = "${{ secrets.GDRIVE_FOLDER_ID }}"
-        GDRIVE_CREDENTIALS_PATH = os.path.expanduser("~/.config/gdrive/service-account.json")
+        INSTAGRAM_APP_ID = "${{ secrets.INSTAGRAM_APP_ID }}"
+        INSTAGRAM_APP_SECRET = "${{ secrets.INSTAGRAM_APP_SECRET }}"
         
-        # Manual override if provided
-        MANUAL_DAY_OVERRIDE = "${{ github.event.inputs.day_number }}"
-        MANUAL_PART_OVERRIDE = "${{ github.event.inputs.part_number }}"
+        # Google Drive Credentials
+        GDRIVE_FOLDER_ID = "${{ secrets.GDRIVE_FOLDER_ID }}"
+        GDRIVE_CREDENTIALS = """${{ secrets.GDRIVE_CREDENTIALS }}"""
+        
+        # Posting Configuration
+        POSTING_TIME = "09:00"  # UTC time
+        TIMEZONE = "UTC"
+        
+        # Caption Template
+        CAPTION_TEMPLATE = """Day {day_number} - Part {part_number}/{total_parts}
+
+📅 Posted automatically on {date}
+⚡ Powered by GitHub Actions & Facebook Graph API
+
+#Day{day_number} #Part{part_number} #InstagramReels #AutoPost #Tech #AI #GitHubActions #Coding #Automation #Reels"""
+        
+        # Error Handling
+        MAX_CONSECUTIVE_ERRORS = 5
         EOF
-    
-    - name: Run Instagram poster
-      env:
-        GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+        
+    - name: Create Google Drive credentials file
+      run: |
+        mkdir -p src
+        cat > src/google_credentials.json << 'EOF'
+        ${{ secrets.GDRIVE_CREDENTIALS }}
+        EOF
+        
+    - name: Run Instagram Poster
       run: |
         cd src
-        python main.py
-    
+        python main.py \
+          --force-day="${{ github.event.inputs.force_day }}" \
+          --force-part="${{ github.event.inputs.force_part }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
     - name: Commit and push state changes
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
+        git config --global user.name 'GitHub Actions'
+        git config --global user.email 'actions@github.com'
         git add state/posting_state.json
-        git commit -m "Update posting state" || echo "No changes to commit"
+        git add src/config.py
+        git commit -m "Update posting state [skip ci]" || echo "No changes to commit"
         git push
+        
+    - name: Cleanup temporary files
+      run: |
+        rm -f src/google_credentials.json
+        rm -f src/temp_video.mp4
+        rm -f src/*.log
+        
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: error-logs
+        path: |
+          src/*.log
+          src/error_*.txt
